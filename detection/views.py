@@ -1,17 +1,14 @@
 import os
-os.environ['MEDIAPIPE_DISABLE_GPU'] = '1'
-
-import numpy as np
 import json
 import base64
-import cv2
-import mediapipe as mp
+import numpy as np
 from collections import deque
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
 # =========================
-# BASE DIR
+# BASE DIR & LABELS
+# Only lightweight things at module level
 # =========================
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 LABELS_PATH = os.path.join(BASE_DIR, 'models', 'labels.json')
@@ -22,26 +19,36 @@ with open(LABELS_PATH, 'r') as f:
 print(f"✅ Labels loaded | Words: {sign_labels}")
 
 # =========================
-# LAZY LOADING
-# Model and MediaPipe load on first request
-# Prevents Render startup timeout
+# LAZY GLOBALS
+# cv2, mediapipe, tensorflow all load on first request
 # =========================
 _lstm_model     = None
 _hands_detector = None
+_cv2            = None
+
+def get_cv2():
+    global _cv2
+    if _cv2 is None:
+        import cv2 as cv2_module
+        _cv2 = cv2_module
+    return _cv2
 
 def get_model():
     global _lstm_model
     if _lstm_model is None:
+        os.environ['MEDIAPIPE_DISABLE_GPU'] = '1'
         from tensorflow.keras.models import load_model
-        path = os.path.join(BASE_DIR, 'models', 'sign_model.h5')
+        path        = os.path.join(BASE_DIR, 'models', 'sign_model.h5')
         _lstm_model = load_model(path)
-        print(f"✅ LSTM model loaded")
+        print("✅ LSTM model loaded")
     return _lstm_model
 
 def get_hands():
     global _hands_detector
     if _hands_detector is None:
-        mp_hands = mp.solutions.hands
+        os.environ['MEDIAPIPE_DISABLE_GPU'] = '1'
+        import mediapipe as mp
+        mp_hands        = mp.solutions.hands
         _hands_detector = mp_hands.Hands(
             static_image_mode=True,
             max_num_hands=2,
@@ -53,7 +60,6 @@ def get_hands():
 
 # =========================
 # SESSION STATE
-# Each browser tab gets its own sequence + buffers
 # =========================
 sessions = {}
 
@@ -87,8 +93,8 @@ def normalize_landmarks(raw_126):
     for h in range(2):
         if np.any(arr[h] != 0):
             arr[h] -= arr[h, 0, :]
-            scale = np.max(np.abs(arr[h])) + 1e-6
-            arr[h] /= scale
+            scale    = np.max(np.abs(arr[h])) + 1e-6
+            arr[h]  /= scale
     return arr.flatten().tolist()
 
 # =========================
@@ -104,17 +110,15 @@ def assign_hands(result):
         slot  = 0 if label == 'Right' else 1
 
         for j, lm in enumerate(hand_lms.landmark):
-            base = slot * 63 + j * 3
-            landmarks[base]     = lm.x
-            landmarks[base + 1] = lm.y
-            landmarks[base + 2] = lm.z
+            base              = slot * 63 + j * 3
+            landmarks[base]   = lm.x
+            landmarks[base+1] = lm.y
+            landmarks[base+2] = lm.z
 
     return normalize_landmarks(landmarks)
 
 # =========================
 # ENDPOINT 1 — /api/frame/
-# Receives one base64 frame from browser
-# Runs MediaPipe + normalize + sequence + predict
 # =========================
 @api_view(['POST'])
 def predict_frame(request):
@@ -126,8 +130,9 @@ def predict_frame(request):
             return Response({'error': 'No frame provided'}, status=400)
 
         session = get_session(session_id)
+        cv2     = get_cv2()
 
-        # ── Decode base64 image ──────────────────────────────────
+        # Decode base64 image
         img_bytes = base64.b64decode(frame_b64)
         img_arr   = np.frombuffer(img_bytes, dtype=np.uint8)
         frame     = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
@@ -135,11 +140,11 @@ def predict_frame(request):
         if frame is None:
             return Response({'error': 'Could not decode frame'}, status=400)
 
-        # ── Flip frame — mirrors predict_realtime.py ─────────────
+        # Flip + convert — mirrors predict_realtime.py
         frame     = cv2.flip(frame, 1)
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # ── MediaPipe hand detection (lazy loaded) ───────────────
+        # MediaPipe detection
         result = get_hands().process(frame_rgb)
 
         if result.multi_hand_landmarks:
@@ -151,9 +156,9 @@ def predict_frame(request):
             if len(session['sequence']) > SEQUENCE_LENGTH:
                 session['sequence'].pop(0)
 
-            # ── Predict when sequence is full ────────────────────
+            # Predict when sequence is full
             if len(session['sequence']) == SEQUENCE_LENGTH:
-                input_data = np.expand_dims(
+                input_data     = np.expand_dims(
                     np.array(session['sequence'], dtype=np.float32), axis=0
                 )
                 probs          = get_model().predict(input_data, verbose=0)[0]
@@ -186,7 +191,6 @@ def predict_frame(request):
             })
 
         else:
-            # No hand detected
             session['no_hand_count'] += 1
 
             if session['no_hand_count'] >= NO_HAND_RESET_AFTER:
@@ -212,8 +216,7 @@ def predict_frame(request):
 
 
 # =========================
-# ENDPOINT 2 — /api/predict/
-# Kept for backward compatibility
+# ENDPOINT 2 — /api/predict/ (backward compat)
 # =========================
 @api_view(['POST'])
 def predict_sign(request):
@@ -228,9 +231,8 @@ def predict_sign(request):
         if sequence.shape != (30, 126):
             return Response({'error': f'Wrong shape: {sequence.shape}'}, status=400)
 
-        input_data = np.expand_dims(sequence, axis=0)
-        prediction = get_model().predict(input_data, verbose=0)[0]
-
+        input_data     = np.expand_dims(sequence, axis=0)
+        prediction     = get_model().predict(input_data, verbose=0)[0]
         confidence     = float(np.max(prediction))
         predicted_idx  = int(np.argmax(prediction))
         predicted_word = sign_labels[predicted_idx]
