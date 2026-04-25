@@ -1,50 +1,59 @@
-from rest_framework.decorators import api_view
-from rest_framework.response import Response
+import os
+os.environ['MEDIAPIPE_DISABLE_GPU'] = '1'
+
 import numpy as np
 import json
 import base64
 import cv2
-
-import os
-os.environ['MEDIAPIPE_DISABLE_GPU'] = '1'
 import mediapipe as mp
-
 from collections import deque
-from tensorflow.keras.models import load_model
+from rest_framework.decorators import api_view
+from rest_framework.response import Response
 
 # =========================
 # BASE DIR
 # =========================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# =========================
-# LOAD LSTM MODEL
-# =========================
-LSTM_MODEL_PATH = os.path.join(BASE_DIR, 'models', 'sign_model.h5')
-LABELS_PATH     = os.path.join(BASE_DIR, 'models', 'labels.json')
-
-lstm_model = load_model(LSTM_MODEL_PATH)
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+LABELS_PATH = os.path.join(BASE_DIR, 'models', 'labels.json')
 
 with open(LABELS_PATH, 'r') as f:
     sign_labels = json.load(f)
 
-print(f"✅ LSTM model loaded | Words: {sign_labels}")
+print(f"✅ Labels loaded | Words: {sign_labels}")
 
 # =========================
-# MEDIAPIPE — single instance (reused across requests)
+# LAZY LOADING
+# Model and MediaPipe load on first request
+# Prevents Render startup timeout
 # =========================
-mp_hands = mp.solutions.hands
-hands_detector = mp_hands.Hands(
-    static_image_mode=True,       # True = one frame at a time from API
-    max_num_hands=2,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
+_lstm_model     = None
+_hands_detector = None
+
+def get_model():
+    global _lstm_model
+    if _lstm_model is None:
+        from tensorflow.keras.models import load_model
+        path = os.path.join(BASE_DIR, 'models', 'sign_model.h5')
+        _lstm_model = load_model(path)
+        print(f"✅ LSTM model loaded")
+    return _lstm_model
+
+def get_hands():
+    global _hands_detector
+    if _hands_detector is None:
+        mp_hands = mp.solutions.hands
+        _hands_detector = mp_hands.Hands(
+            static_image_mode=True,
+            max_num_hands=2,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        print("✅ MediaPipe hands loaded")
+    return _hands_detector
 
 # =========================
-# PER-SESSION STATE
-# Each browser session gets its own sequence + smoothing buffers
-# Keyed by session_id sent from the frontend
+# SESSION STATE
+# Each browser tab gets its own sequence + buffers
 # =========================
 sessions = {}
 
@@ -64,12 +73,11 @@ def get_session(session_id):
     return sessions[session_id]
 
 def clear_session(session_id):
-    if session_id in sessions:
-        sessions[session_id] = {
-            'sequence':      [],
-            'pred_buffer':   deque(maxlen=BUFFER_SIZE),
-            'no_hand_count': 0,
-        }
+    sessions[session_id] = {
+        'sequence':      [],
+        'pred_buffer':   deque(maxlen=BUFFER_SIZE),
+        'no_hand_count': 0,
+    }
 
 # =========================
 # NORMALIZATION — mirrors collect_data.py exactly
@@ -105,8 +113,8 @@ def assign_hands(result):
 
 # =========================
 # ENDPOINT 1 — /api/frame/
-# Receives one base64 frame, extracts landmarks,
-# builds sequence, predicts when ready
+# Receives one base64 frame from browser
+# Runs MediaPipe + normalize + sequence + predict
 # =========================
 @api_view(['POST'])
 def predict_frame(request):
@@ -131,8 +139,8 @@ def predict_frame(request):
         frame     = cv2.flip(frame, 1)
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # ── MediaPipe hand detection ─────────────────────────────
-        result = hands_detector.process(frame_rgb)
+        # ── MediaPipe hand detection (lazy loaded) ───────────────
+        result = get_hands().process(frame_rgb)
 
         if result.multi_hand_landmarks:
             session['no_hand_count'] = 0
@@ -148,9 +156,9 @@ def predict_frame(request):
                 input_data = np.expand_dims(
                     np.array(session['sequence'], dtype=np.float32), axis=0
                 )
-                probs         = lstm_model.predict(input_data, verbose=0)[0]
-                predicted_idx = int(np.argmax(probs))
-                confidence    = float(probs[predicted_idx])
+                probs          = get_model().predict(input_data, verbose=0)[0]
+                predicted_idx  = int(np.argmax(probs))
+                confidence     = float(probs[predicted_idx])
                 predicted_word = sign_labels[predicted_idx]
 
                 if confidence >= PREDICTION_THRESHOLD:
@@ -204,7 +212,8 @@ def predict_frame(request):
 
 
 # =========================
-# ENDPOINT 2 — /api/predict/ (kept for backward compatibility)
+# ENDPOINT 2 — /api/predict/
+# Kept for backward compatibility
 # =========================
 @api_view(['POST'])
 def predict_sign(request):
@@ -220,10 +229,10 @@ def predict_sign(request):
             return Response({'error': f'Wrong shape: {sequence.shape}'}, status=400)
 
         input_data = np.expand_dims(sequence, axis=0)
-        prediction = lstm_model.predict(input_data, verbose=0)[0]
+        prediction = get_model().predict(input_data, verbose=0)[0]
 
-        confidence    = float(np.max(prediction))
-        predicted_idx = int(np.argmax(prediction))
+        confidence     = float(np.max(prediction))
+        predicted_idx  = int(np.argmax(prediction))
         predicted_word = sign_labels[predicted_idx]
 
         if confidence < 0.60:
