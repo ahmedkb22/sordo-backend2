@@ -1,11 +1,14 @@
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 import numpy as np
-import os
 import json
 import base64
 import cv2
+
+import os
+os.environ['MEDIAPIPE_DISABLE_GPU'] = '1'
 import mediapipe as mp
+
 from collections import deque
 from tensorflow.keras.models import load_model
 

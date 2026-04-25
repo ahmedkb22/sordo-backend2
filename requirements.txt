@@ -2,8 +2,8 @@ django
 djangorestframework
 django-cors-headers
 tensorflow==2.15.0
-numpy
+numpy==1.26.4
 gunicorn
 whitenoise
-mediapipe
-opencv-python-headless
+mediapipe==0.10.9
+opencv-python-headless==4.9.0.80
