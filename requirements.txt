@@ -5,3 +5,5 @@ tensorflow==2.15.0
 numpy
 gunicorn
 whitenoise
+mediapipe
+opencv-python-headless
